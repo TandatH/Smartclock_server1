@@ -1,42 +1,36 @@
-from flask import Flask, request, jsonify
-import base64, cv2, numpy as np
-import onnxruntime as ort
+from flask import Flask, request, jsonify, send_from_directory
+import base64, cv2, numpy as np, onnxruntime as ort
 import os, time, requests
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # ảnh max 10MB
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # ảnh tối đa 10MB
 
-# ====================== CONFIG ======================
-# 🔗 Link tải model từ Google Drive (chỉ cần đổi ID)
-#   Link Drive: https://drive.google.com/file/d/1ABCDefGhIJKlmnop/view?usp=sharing
-#   ID = 1ABCDefGhIJKlmnop
 MODEL_URL = "https://drive.google.com/uc?export=download&id=1yvDBiywqOYTOBQ0mspwMqseQ4ccN_L2y"
-MODEL_DIR = "models"
+MODEL_DIR = "/tmp/models"
+UPLOAD_DIR = "/tmp/uploads"
 MODEL_PATH = os.path.join(MODEL_DIR, "face_model.onnx")
 
 os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ====================== DOWNLOAD MODEL ======================
 def download_model():
     if not os.path.exists(MODEL_PATH):
-        print("📥 Đang tải model từ Google Drive...")
+        print("📥 Đang tải model...")
         r = requests.get(MODEL_URL, allow_redirects=True)
         if r.status_code == 200:
             with open(MODEL_PATH, "wb") as f:
                 f.write(r.content)
-            print(f"✅ Model tải thành công → {MODEL_PATH}")
+            print("✅ Model tải xong:", MODEL_PATH)
         else:
             raise RuntimeError(f"❌ Lỗi tải model ({r.status_code})")
 
 download_model()
 
-# ====================== LOAD MODEL ======================
-print("🔄 Đang load model...")
+print("🔄 Load model...")
 session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
 input_name = session.get_inputs()[0].name
-print("✅ Model đã load:", MODEL_PATH)
+print("✅ Model đã load.")
 
-# ====================== PREPROCESS ======================
 def preprocess(img):
     img = cv2.resize(img, (112, 112))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -45,7 +39,6 @@ def preprocess(img):
     img = img.astype(np.float32) / 127.5 - 1.0
     return img
 
-# ====================== UPLOAD ROUTE ======================
 @app.route("/upload", methods=["POST"])
 def upload():
     try:
@@ -62,29 +55,31 @@ def upload():
         if img is None:
             return jsonify({"error": "Không giải mã được ảnh"}), 400
 
-        os.makedirs("uploads", exist_ok=True)
-        filename = f"uploads/{rfid}_{int(time.time())}.jpg"
-        cv2.imwrite(filename, img)
+        filename = f"{rfid}_{int(time.time())}.jpg"
+        img_path = os.path.join(UPLOAD_DIR, filename)
+        cv2.imwrite(img_path, img)
 
-        # Tạo embedding từ ảnh
         input_tensor = preprocess(img)
         embedding = session.run(None, {input_name: input_tensor})[0][0]
+        embedding = embedding / np.linalg.norm(embedding)
 
-        # ✅ Lưu embedding ra file .npy (để ESP32-S3 tải về)
-        emb_path = filename.replace(".jpg", ".npy")
+        emb_path = img_path.replace(".jpg", ".npy")
         np.save(emb_path, embedding)
 
-        print(f"✅ Nhận ảnh từ {rfid} | {len(embedding)} chiều | Lưu tại {filename}")
+        print(f"✅ Nhận ảnh {rfid} | {embedding.shape[0]} chiều")
 
         return jsonify({
             "status": "ok",
-            "embedding_dim": len(embedding),
-            "embedding_url": request.host_url + emb_path,  # Đường dẫn tải embedding
+            "embedding_dim": embedding.shape[0],
+            "embedding_url": request.host_url + "uploads/" + os.path.basename(emb_path),
         })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ====================== MAIN ======================
+@app.route("/uploads/<path:filename>")
+def serve_file(filename):
+    return send_from_directory(UPLOAD_DIR, filename)
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
