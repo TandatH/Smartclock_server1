@@ -2,3 +2,4 @@ flask
 onnxruntime
 numpy
 opencv-python-headless
+gunicorn
