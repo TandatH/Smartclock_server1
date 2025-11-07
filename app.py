@@ -3,67 +3,48 @@ import base64, cv2, numpy as np, onnxruntime as ort
 import os, time, requests
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # Giới hạn 10MB ảnh upload
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # ảnh tối đa 10MB
 
-# ======================
-# ĐƯỜNG DẪN VÀ MODEL
-# ======================
-FILE_ID = "1yvDBiywqOYTOBQ0mspwMqseQ4ccN_L2y"
+# 🔗 Link model HuggingFace (phải dùng dạng "resolve/main" thay vì "blob/main")
+MODEL_URL = "https://huggingface.co/pherodat1104/face_model/resolve/main/face_model.onnx"
+
+# 📁 Đường dẫn lưu model & upload
 MODEL_DIR = "/tmp/models"
 UPLOAD_DIR = "/tmp/uploads"
 MODEL_PATH = os.path.join(MODEL_DIR, "face_model.onnx")
+
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ======================
-# HÀM TẢI MODEL GOOGLE DRIVE
-# ======================
+# ============================ TẢI MODEL ============================ #
 def download_model():
-    if os.path.exists(MODEL_PATH):
-        print("✅ Model đã tồn tại:", MODEL_PATH)
-        print("📏 Kích thước:", os.path.getsize(MODEL_PATH), "bytes")
-        return
-
-    print("📥 Đang tải model từ Google Drive...")
-    gdrive_api = f"https://drive.google.com/uc?export=download&id={FILE_ID}"
-
-    session = requests.Session()
-    response = session.get(gdrive_api, stream=True)
-
-    # Nếu có token xác nhận (file >100MB hoặc cần confirm)
-    for k, v in response.cookies.items():
-        if k.startswith("download_warning"):
-            confirm_token = v
-            gdrive_api = f"{gdrive_api}&confirm={confirm_token}"
-            response = session.get(gdrive_api, stream=True)
-            break
-
-    if response.status_code == 200:
-        with open(MODEL_PATH, "wb") as f:
-            for chunk in response.iter_content(1024):
-                if chunk:
-                    f.write(chunk)
-        print("✅ Model tải thành công:", MODEL_PATH)
-        print("📏 Kích thước:", os.path.getsize(MODEL_PATH), "bytes")
-
-        if os.path.getsize(MODEL_PATH) < 1000000:
-            raise RuntimeError("❌ File tải quá nhỏ (<1MB) — có thể Google trả về HTML, hãy kiểm tra link chia sẻ!")
-
+    if not os.path.exists(MODEL_PATH):
+        print("📥 Đang tải model từ HuggingFace...")
+        r = requests.get(MODEL_URL, allow_redirects=True)
+        if r.status_code == 200:
+            with open(MODEL_PATH, "wb") as f:
+                f.write(r.content)
+            size = os.path.getsize(MODEL_PATH)
+            print(f"✅ Model tải xong: {MODEL_PATH}")
+            print(f"📏 Kích thước: {size} bytes")
+            if size < 1000000:
+                raise RuntimeError("❌ File model quá nhỏ (<1MB) — link có thể sai hoặc HuggingFace trả về HTML!")
+        else:
+            raise RuntimeError(f"❌ Lỗi tải model ({r.status_code})")
     else:
-        raise RuntimeError(f"❌ Lỗi tải model ({response.status_code})")
+        size = os.path.getsize(MODEL_PATH)
+        print(f"✅ Model đã tồn tại: {MODEL_PATH} ({size} bytes)")
 
-# ======================
-# LOAD MODEL
-# ======================
+# Gọi tải model khi khởi động
 download_model()
+
+# ============================ LOAD MODEL ============================ #
 print("🔄 Đang load model ONNX...")
 session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
 input_name = session.get_inputs()[0].name
-print("✅ Model đã load thành công!")
+print("✅ Model ONNX đã load thành công!")
 
-# ======================
-# XỬ LÝ ẢNH
-# ======================
+# ============================ XỬ LÝ ẢNH ============================ #
 def preprocess(img):
     img = cv2.resize(img, (112, 112))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -72,9 +53,7 @@ def preprocess(img):
     img = img.astype(np.float32) / 127.5 - 1.0
     return img
 
-# ======================
-# API UPLOAD ẢNH
-# ======================
+# ============================ API /UPLOAD ============================ #
 @app.route("/upload", methods=["POST"])
 def upload():
     try:
@@ -95,6 +74,7 @@ def upload():
         img_path = os.path.join(UPLOAD_DIR, filename)
         cv2.imwrite(img_path, img)
 
+        # Run model
         input_tensor = preprocess(img)
         embedding = session.run(None, {input_name: input_tensor})[0][0]
         embedding = embedding / np.linalg.norm(embedding)
@@ -111,18 +91,13 @@ def upload():
         })
 
     except Exception as e:
-        print("❌ Lỗi xử lý ảnh:", e)
         return jsonify({"error": str(e)}), 500
 
-# ======================
-# ROUTE TRẢ FILE
-# ======================
+# ============================ PHỤC VỤ FILE ============================ #
 @app.route("/uploads/<path:filename>")
 def serve_file(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
-# ======================
-# CHẠY LOCAL
-# ======================
+# ============================ MAIN ============================ #
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
