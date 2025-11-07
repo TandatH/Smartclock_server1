@@ -1,103 +1,100 @@
-from flask import Flask, request, jsonify, send_from_directory
-import base64, cv2, numpy as np, onnxruntime as ort
-import os, time, requests
+from flask import Flask, request, jsonify
+import onnxruntime as ort
+import numpy as np
+import cv2
+import os
+import requests
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # ảnh tối đa 10MB
 
-# 🔗 Link model HuggingFace (phải dùng dạng "resolve/main" thay vì "blob/main")
+# ===========================
+# 🔹 1. TẢI MODEL TỪ HUGGINGFACE
+# ===========================
 MODEL_URL = "https://huggingface.co/pherodat1104/face_model/resolve/main/face_model.onnx"
+MODEL_PATH = "/tmp/models/face_model.onnx"
+os.makedirs("/tmp/models", exist_ok=True)
 
-# 📁 Đường dẫn lưu model & upload
-MODEL_DIR = "/tmp/models"
-UPLOAD_DIR = "/tmp/uploads"
-MODEL_PATH = os.path.join(MODEL_DIR, "face_model.onnx")
-
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# ============================ TẢI MODEL ============================ #
 def download_model():
-    if not os.path.exists(MODEL_PATH):
-        print("📥 Đang tải model từ HuggingFace...")
-        r = requests.get(MODEL_URL, allow_redirects=True)
-        if r.status_code == 200:
-            with open(MODEL_PATH, "wb") as f:
-                f.write(r.content)
-            size = os.path.getsize(MODEL_PATH)
-            print(f"✅ Model tải xong: {MODEL_PATH}")
-            print(f"📏 Kích thước: {size} bytes")
-            if size < 1000000:
-                raise RuntimeError("❌ File model quá nhỏ (<1MB) — link có thể sai hoặc HuggingFace trả về HTML!")
-        else:
-            raise RuntimeError(f"❌ Lỗi tải model ({r.status_code})")
+    if os.path.exists(MODEL_PATH):
+        print("✅ Model đã có sẵn, bỏ qua tải lại.")
+        return
+    print("📥 Đang tải model từ HuggingFace...")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(MODEL_URL, headers=headers, stream=True)
+    if response.status_code == 200:
+        with open(MODEL_PATH, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f"✅ Model tải xong: {MODEL_PATH}")
+        print(f"📏 Kích thước: {os.path.getsize(MODEL_PATH)} bytes")
     else:
-        size = os.path.getsize(MODEL_PATH)
-        print(f"✅ Model đã tồn tại: {MODEL_PATH} ({size} bytes)")
+        print(f"❌ Lỗi tải model: {response.status_code}")
+        raise Exception(f"Lỗi tải model từ HuggingFace ({response.status_code})")
 
-# Gọi tải model khi khởi động
+# Tải model khi khởi động
 download_model()
 
-# ============================ LOAD MODEL ============================ #
+# ===========================
+# 🔹 2. LOAD MODEL
+# ===========================
 print("🔄 Đang load model ONNX...")
-session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
-input_name = session.get_inputs()[0].name
+ort_session = ort.InferenceSession(MODEL_PATH)
 print("✅ Model ONNX đã load thành công!")
 
-# ============================ XỬ LÝ ẢNH ============================ #
-def preprocess(img):
-    img = cv2.resize(img, (112, 112))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = np.transpose(img, (2, 0, 1))
-    img = np.expand_dims(img, axis=0)
-    img = img.astype(np.float32) / 127.5 - 1.0
-    return img
+# ===========================
+# 🔹 3. ROUTE GỐC — KIỂM TRA SERVER
+# ===========================
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "message": "✅ SmartClock Server đang hoạt động!",
+        "status": "online",
+        "model_loaded": os.path.exists(MODEL_PATH)
+    })
 
-# ============================ API /UPLOAD ============================ #
+# ===========================
+# 🔹 4. ROUTE UPLOAD ẢNH
+# ===========================
 @app.route("/upload", methods=["POST"])
-def upload():
+def upload_image():
     try:
-        data = request.get_json()
-        img_base64 = data.get("image")
-        rfid = data.get("rfid", "unknown")
+        if "image" not in request.files:
+            return jsonify({"error": "Không có file 'image' trong request!"}), 400
 
-        if not img_base64:
-            return jsonify({"error": "Thiếu ảnh base64"}), 400
-
-        img_data = base64.b64decode(img_base64)
-        img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
+        file = request.files["image"]
+        image_bytes = np.frombuffer(file.read(), np.uint8)
+        img = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
 
         if img is None:
-            return jsonify({"error": "Không giải mã được ảnh"}), 400
+            return jsonify({"error": "Không đọc được ảnh!"}), 400
 
-        filename = f"{rfid}_{int(time.time())}.jpg"
-        img_path = os.path.join(UPLOAD_DIR, filename)
-        cv2.imwrite(img_path, img)
+        # Resize ảnh cho khớp model (ví dụ: 112x112)
+        img_resized = cv2.resize(img, (112, 112))
+        img_resized = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        img_tensor = img_resized.astype(np.float32) / 255.0
+        img_tensor = np.transpose(img_tensor, (2, 0, 1))  # CHW
+        img_tensor = np.expand_dims(img_tensor, axis=0)  # NCHW
 
-        # Run model
-        input_tensor = preprocess(img)
-        embedding = session.run(None, {input_name: input_tensor})[0][0]
-        embedding = embedding / np.linalg.norm(embedding)
+        # Dự đoán
+        ort_inputs = {ort_session.get_inputs()[0].name: img_tensor}
+        emb = ort_session.run(None, ort_inputs)[0]
 
-        emb_path = img_path.replace(".jpg", ".npy")
-        np.save(emb_path, embedding)
-
-        print(f"✅ Nhận ảnh {rfid} | vector {embedding.shape[0]} chiều")
+        emb_mean = np.mean(emb)
+        print(f"✅ Nhận ảnh OK - mean embedding: {emb_mean:.6f}")
 
         return jsonify({
-            "status": "ok",
-            "embedding_dim": int(embedding.shape[0]),
-            "embedding_url": request.host_url + "uploads/" + os.path.basename(emb_path),
+            "status": "success",
+            "embedding_mean": float(emb_mean)
         })
 
     except Exception as e:
+        print(f"❌ Lỗi xử lý upload: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ============================ PHỤC VỤ FILE ============================ #
-@app.route("/uploads/<path:filename>")
-def serve_file(filename):
-    return send_from_directory(UPLOAD_DIR, filename)
-
-# ============================ MAIN ============================ #
+# ===========================
+# 🔹 5. KHỞI CHẠY
+# ===========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"🚀 Server đang chạy tại cổng {port}")
+    app.run(host="0.0.0.0", port=port)
