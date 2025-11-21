@@ -4,97 +4,105 @@ import numpy as np
 import cv2
 import os
 import requests
+import math
+import json
 
 app = Flask(__name__)
 
-# ===========================
-# 🔹 1. TẢI MODEL TỪ HUGGINGFACE
-# ===========================
+# ================================
+# 🔥 Firebase Realtime Database
+# ================================
+FIREBASE_URL = "https://smartclock-2025-default-rtdb.firebaseio.com/users/dat/embedding.json"
+
+# ================================
+# 🔥 Load model
+# ================================
 MODEL_URL = "https://huggingface.co/pherodat1104/face_model/resolve/main/face_model.onnx"
 MODEL_PATH = "/tmp/models/face_model.onnx"
 os.makedirs("/tmp/models", exist_ok=True)
 
 def download_model():
     if os.path.exists(MODEL_PATH):
-        print("✅ Model đã có sẵn, bỏ qua tải lại.")
         return
-    print("📥 Đang tải model từ HuggingFace...")
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(MODEL_URL, headers=headers, stream=True)
-    if response.status_code == 200:
-        with open(MODEL_PATH, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        print(f"✅ Model tải xong: {MODEL_PATH}")
-        print(f"📏 Kích thước: {os.path.getsize(MODEL_PATH)} bytes")
-    else:
-        print(f"❌ Lỗi tải model: {response.status_code}")
-        raise Exception(f"Lỗi tải model từ HuggingFace ({response.status_code})")
+    r = requests.get(MODEL_URL, stream=True)
+    with open(MODEL_PATH, "wb") as f:
+        for chunk in r.iter_content(8192):
+            f.write(chunk)
 
-# Tải model khi khởi động
 download_model()
 
-# ===========================
-# 🔹 2. LOAD MODEL
-# ===========================
-print("🔄 Đang load model ONNX...")
-ort_session = ort.InferenceSession(MODEL_PATH)
-print("✅ Model ONNX đã load thành công!")
+ort_session = ort.InferenceSession(
+    MODEL_PATH, providers=["CPUExecutionProvider"]
+)
 
-# ===========================
-# 🔹 3. ROUTE GỐC — KIỂM TRA SERVER
-# ===========================
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({
-        "message": "✅ SmartClock Server đang hoạt động!",
-        "status": "online",
-        "model_loaded": os.path.exists(MODEL_PATH)
-    })
+# ================================
+# 🔥 HÀM COSINE SIMILARITY
+# ================================
+def cosine_similarity(v1, v2):
+    v1 = np.array(v1)
+    v2 = np.array(v2)
+    dot = np.dot(v1, v2)
+    norm1 = np.linalg.norm(v1)
+    norm2 = np.linalg.norm(v2)
+    return dot / (norm1 * norm2 + 1e-6)
 
-# ===========================
-# 🔹 4. ROUTE UPLOAD ẢNH
-# ===========================
+# ================================
+# 🔥 ROUTE UPLOAD ẢNH
+# ================================
 @app.route("/upload", methods=["POST"])
 def upload_image():
-    try:
-        if "image" not in request.files:
-            return jsonify({"error": "Không có file 'image' trong request!"}), 400
 
-        file = request.files["image"]
-        image_bytes = np.frombuffer(file.read(), np.uint8)
-        img = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
+    if "image" not in request.files:
+        return jsonify({"error": "Không có file image!"}), 400
 
-        if img is None:
-            return jsonify({"error": "Không đọc được ảnh!"}), 400
+    # ====== Decode ảnh ======
+    file = request.files["image"]
+    img_bytes = np.frombuffer(file.read(), np.uint8)
+    img = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
+    if img is None:
+        return jsonify({"error": "Ảnh lỗi không decode được!"}), 400
 
-        # Resize ảnh cho khớp model (ví dụ: 112x112)
-        img_resized = cv2.resize(img, (112, 112))
-        img_resized = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-        img_tensor = img_resized.astype(np.float32) / 255.0
-        img_tensor = np.transpose(img_tensor, (2, 0, 1))  # CHW
-        img_tensor = np.expand_dims(img_tensor, axis=0)  # NCHW
+    # ====== Chuẩn hoá ảnh ======
+    img = cv2.resize(img, (112, 112))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    tensor = img.astype(np.float32) / 255.0
+    tensor = np.transpose(tensor, (2, 0, 1))
+    tensor = np.expand_dims(tensor, 0)
 
-        # Dự đoán
-        ort_inputs = {ort_session.get_inputs()[0].name: img_tensor}
-        emb = ort_session.run(None, ort_inputs)[0]
+    # ====== Generate embedding ======
+    input_name = ort_session.get_inputs()[0].name
+    emb = ort_session.run(None, {input_name: tensor})[0][0]  # shape (512,)
 
-        emb_mean = np.mean(emb)
-        print(f"✅ Nhận ảnh OK - mean embedding: {emb_mean:.6f}")
+    # ====== Lấy embedding lưu trong Firebase ======
+    fb = requests.get(FIREBASE_URL)
+    saved_emb = fb.json()
 
-        return jsonify({
-            "status": "success",
-            "embedding_mean": float(emb_mean)
-        })
+    if saved_emb is None:
+        return jsonify({"error": "Firebase chưa có embedding!"}), 500
 
-    except Exception as e:
-        print(f"❌ Lỗi xử lý upload: {e}")
-        return jsonify({"error": str(e)}), 500
+    # Convert từ dict → list
+    saved_emb_list = [saved_emb[str(i)] for i in range(512)]
 
-# ===========================
-# 🔹 5. KHỞI CHẠY
-# ===========================
+    # ====== Tính Similarity ======
+    similarity = cosine_similarity(emb, saved_emb_list)
+
+    print("🔥 Similarity:", similarity)
+
+    # ====== Ngưỡng nhận diện ======
+    THRESHOLD = 0.55   # bạn có thể nâng lên 0.6 nếu muốn chính xác hơn
+
+    match = similarity > THRESHOLD
+
+    return jsonify({
+        "status": "success",
+        "similarity": float(similarity),
+        "match": match,
+        "threshold": THRESHOLD
+    })
+
+
+# ================================
+# 🔥 CHẠY SERVER
+# ================================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Server đang chạy tại cổng {port}")
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
