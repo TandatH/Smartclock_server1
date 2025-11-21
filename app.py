@@ -4,8 +4,6 @@ import numpy as np
 import cv2
 import os
 import requests
-import math
-import json
 
 app = Flask(__name__)
 
@@ -52,10 +50,10 @@ def cosine_similarity(v1, v2):
 @app.route("/upload", methods=["POST"])
 def upload_image():
 
+    # ====== Kiểm tra file ======
     if "image" not in request.files:
         return jsonify({"error": "Không có file image!"}), 400
 
-    # ====== Decode ảnh ======
     file = request.files["image"]
     img_bytes = np.frombuffer(file.read(), np.uint8)
     img = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
@@ -77,20 +75,35 @@ def upload_image():
     fb = requests.get(FIREBASE_URL)
     saved_emb = fb.json()
 
-    if saved_emb is None:
+    if not saved_emb:
         return jsonify({"error": "Firebase chưa có embedding!"}), 500
 
-    # Convert từ dict → list
-    saved_emb_list = [saved_emb[str(i)] for i in range(512)]
+    # ====== Xử lý dữ liệu từ Firebase ======
+    saved_emb_list = None
+
+    if isinstance(saved_emb, list):
+        saved_emb_list = saved_emb
+    elif isinstance(saved_emb, dict):
+        if "embedding" in saved_emb:
+            saved_emb_list = saved_emb["embedding"]
+        else:
+            # fallback: sắp xếp theo key số
+            try:
+                saved_emb_list = [saved_emb[k] for k in sorted(saved_emb.keys(), key=int)]
+            except Exception as e:
+                return jsonify({"error": "Dữ liệu embedding Firebase không hợp lệ!", "detail": str(e)}), 500
+    else:
+        return jsonify({"error": "Dữ liệu embedding Firebase không hợp lệ!"}), 500
+
+    if len(saved_emb_list) != 512:
+        return jsonify({"error": "Embedding Firebase không đủ 512 chiều!", "length": len(saved_emb_list)}), 500
 
     # ====== Tính Similarity ======
     similarity = cosine_similarity(emb, saved_emb_list)
-
     print("🔥 Similarity:", similarity)
 
     # ====== Ngưỡng nhận diện ======
-    THRESHOLD = 0.55   # bạn có thể nâng lên 0.6 nếu muốn chính xác hơn
-
+    THRESHOLD = 0.55
     match = similarity > THRESHOLD
 
     return jsonify({
